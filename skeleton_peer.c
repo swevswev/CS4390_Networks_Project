@@ -44,12 +44,126 @@
 
 static int msg = 0;
 
+/* Configuration values */
+#define MAX_PATH_LEN 260
+char shared_folder[MAX_PATH_LEN] = "./sharedFolder";
+char tracker_ip[64] = "127.0.0.1";
+int  tracker_port = 5000;
+int  refresh_interval = 900; 
+int peer_listen_port = 6000;
+
+static void strip_comment(char *line) {
+    char *hash = strchr(line, '#');
+    if (hash) *hash = '\0';
+}
+
+static int first_token_as_string(const char *line, char *out, size_t out_sz) {
+    while (*line == ' ' || *line == '\t' || *line == '\r' || *line == '\n') line++;
+    if (*line == '\0') return 0;
+    size_t i = 0;
+    while (*line && *line != ' ' && *line != '\t' && *line != '\r' && *line != '\n' && i + 1 < out_sz) {
+        out[i++] = *line++;
+    }
+    out[i] = '\0';
+    return i > 0;
+}
+
+static int first_token_as_int(const char *line, int *out_val) {
+    char buf[64];
+    if (!first_token_as_string(line, buf, sizeof(buf))) return 0;
+    *out_val = atoi(buf);
+    return 1;
+}
+
+// Loads the client configuration from the clientThreadConfig.cfg file
+static void load_client_config(void) {
+    FILE *f = fopen("clientThreadConfig.cfg", "r");
+    char line[256];
+    if (!f) {
+        fprintf(stderr, "Warning: cannot open clientThreadConfig.cfg, defaulting.\n");
+        return;
+    }
+    if (fgets(line, sizeof(line), f)) {
+        strip_comment(line);
+        first_token_as_string(line, tracker_ip, sizeof(tracker_ip));
+    }
+    if (fgets(line, sizeof(line), f)) {
+        strip_comment(line);
+        first_token_as_int(line, &tracker_port);
+    }
+    if (fgets(line, sizeof(line), f)) {
+        strip_comment(line);
+        int tmp;
+        if (first_token_as_int(line, &tmp) && tmp > 0)
+            refresh_interval = tmp;
+    }
+    fclose(f);
+}
+
+// Loads the server configuration from the serverThreadConfig.cfg file
+static void load_server_config(void) {
+    FILE *f = fopen("serverThreadConfig.cfg", "r");
+    char line[256];
+
+    if (!f) {
+        fprintf(stderr, "Warning: cannot open serverThreadConfig.cfg, defaulting.\n");
+        return;
+    }
+
+    if (fgets(line, sizeof(line), f)) {
+        strip_comment(line);
+        first_token_as_int(line, &peer_listen_port);
+    }
+
+    if (fgets(line, sizeof(line), f)) {
+        strip_comment(line);
+        first_token_as_string(line, shared_folder, sizeof(shared_folder));
+    }
+
+    fclose(f);
+}
+
+static int send_all(socket_t sock, const char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        int n = send(sock, buf + off, (int)(len - off), 0);
+        if (n <= 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int recv_line(socket_t sock, char *out, size_t cap) {
+    size_t used = 0;
+    while (used + 1 < cap) {
+        char ch;
+        int n = recv(sock, &ch, 1, 0);
+        if (n <= 0) break;
+        out[used++] = ch;
+        if (ch == '\n') break;
+    }
+    out[used] = '\0';
+    return (int)used;
+}
+
+static void trim_eol(char *s) {
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
+        s[n - 1] = '\0';
+        n--;
+    }
+}
+
 int main(int argc, char *argv[]) {
-    char server_address[50];
-    int server_port = 3490;  /* TODO: read this from a configuration file. */
+    char server_address[64];
+    load_client_config();
+    load_server_config();
 
     struct sockaddr_in server_addr;
     socket_t sockid;
+
+    printf("Tracker: %s:%d, Peer listen: %d, Shared: %s, Interval: %d\n",
+        tracker_ip, tracker_port, peer_listen_port, shared_folder, refresh_interval);
 
 #ifdef _WIN32
     /* Initialize Winsock once before using any socket API on Windows. */
@@ -75,14 +189,13 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    /* For now, assume server is on localhost.
-     * TODO: Populate server_address from argv or a config file.
-     */
-    strcpy(server_address, "127.0.0.1");
+    /* Tracker address comes from clientThreadConfig.cfg */
+    strncpy(server_address, tracker_ip, sizeof(server_address) - 1);
+    server_address[sizeof(server_address) - 1] = '\0';
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;              /* IPv4 */
-    server_addr.sin_port   = htons(server_port);   /* host to network byte order */
+    server_addr.sin_port   = htons(tracker_port);  /* host to network byte order */
 
     if (inet_pton(AF_INET, server_address, &server_addr.sin_addr) <= 0) {
         fprintf(stderr, "Invalid server address: %s\n", server_address);
@@ -103,15 +216,11 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    /* If connected successfully, handle the LIST command as an example. */
     if (argc > 1 && !strcmp(argv[1], "list")) {
-        /* In the assignment, LIST is part of the higher‑level protocol.
-         * Here we simply send a small integer as a placeholder.
-         */
-        int list_req = htons(LIST);
-        int bytes_sent = send(sockid, (const char *) &list_req, sizeof(list_req), 0);
-        if (bytes_sent < 0) {
-            fprintf(stderr, "Send_request failure\n");
+        /* Send LIST request to the tracker. */
+        const char *req = "<REQ LIST>\n";
+        if (send_all(sockid, req, strlen(req)) != 0) {
+            fprintf(stderr, "Send <REQ LIST> failure\n");
             CLOSESOCK(sockid);
 #ifdef _WIN32
             WSACleanup();
@@ -119,15 +228,21 @@ int main(int argc, char *argv[]) {
             return EXIT_FAILURE;
         }
 
-        /* Read back a simple integer reply as a placeholder. */
-        int bytes_recv = recv(sockid, (char *) &msg, sizeof(msg), 0);
-        if (bytes_recv < 0) {
-            fprintf(stderr, "Read failure\n");
-            CLOSESOCK(sockid);
+        /* Read and print lines until "<REP LIST END>". */
+        char line[4096];
+        for (;;) {
+            int n = recv_line(sockid, line, sizeof(line));
+            if (n <= 0) {
+                fprintf(stderr, "Read LIST reply failure\n");
+                CLOSESOCK(sockid);
 #ifdef _WIN32
-            WSACleanup();
+                WSACleanup();
 #endif
-            return EXIT_FAILURE;
+                return EXIT_FAILURE;
+            }
+            trim_eol(line);
+            printf("%s\n", line);
+            if (!strcmp(line, "<REP LIST END>")) break;
         }
     }
 
