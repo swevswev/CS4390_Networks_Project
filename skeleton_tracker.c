@@ -1,47 +1,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 
-/*
- * Cross‑platform socket includes and typedefs.
- * - On Linux / POSIX, we retain the original fork‑based, multi‑process skeleton.
- * - On Windows, this file currently only provides a stub main that tells you the
- *   tracker is not yet implemented; you can later replace it with a threaded
- *   implementation if desired.
- */
-#ifdef _WIN32
-  #ifndef WIN32_LEAN_AND_MEAN
-    #define WIN32_LEAN_AND_MEAN
-  #endif
-  #include <winsock2.h>
-  #include <ws2tcpip.h>
-  #include <direct.h>
-  #include <windows.h>
-  #include <stdint.h>
-
-  typedef SOCKET socket_t;
-  #define CLOSESOCK(s) closesocket(s)
-#else
-  #include <unistd.h>
-  #include <errno.h>
-  #include <sys/types.h>
-  #include <sys/socket.h>
-  #include <netinet/in.h>
-  #include <arpa/inet.h>
-  #include <dirent.h>
-
-  typedef int socket_t;
-  #define CLOSESOCK(s) close(s)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <direct.h>
+#include <windows.h>
+#include <stdint.h>
+#include <time.h>
+
+typedef SOCKET socket_t;
+#define CLOSESOCK(s) closesocket(s)
 
 /* Placeholder values and buffers that the original skeleton assumed existed.
  */
 #define MAXLINE 4096
 
 static int server_port = 3490;   /* TODO: read from tracker config file. */
-static char read_msg[MAXLINE];
-static char fname[256];
 
 static void strip_comment_line(char *line) {
     char *hash = strchr(line, '#');
@@ -85,12 +63,6 @@ static int load_tracker_port_from_client_config(void) {
     fclose(f);
     return port;
 }
-
-/* Forward declaration of the per‑client handler for POSIX builds. */
-static void peer_handler(int sock_child);
-
-
-#ifdef _WIN32
 
 static const char *TRACKER_DIR = "tracker_shared";
 
@@ -274,6 +246,10 @@ static void tracker_path_for(const char *track_name, char out[512]) {
     snprintf(out, 512, "%s\\%s", TRACKER_DIR, track_name);
 }
 
+static long current_unix_time(void) {
+    return (long)time(NULL);
+}
+
 static void handle_createtracker(socket_t client, char *line) {
     /* Expected: <createtracker filename filesize description md5 ip port>\n */
     trim_angle(line);
@@ -325,10 +301,113 @@ static void handle_createtracker(socket_t client, char *line) {
     fprintf(f, "filesize %s\n", filesize);
     fprintf(f, "description %s\n", desc);
     fprintf(f, "md5 %s\n", md5);
-    fprintf(f, "peer %s %s\n", ip, port);
+    fprintf(f, "peer %s %s 0 %s %ld\n", ip, port, filesize, current_unix_time());
     fclose(f);
 
     send_all(client, "<createtracker succ>\n", strlen("<createtracker succ>\n"));
+}
+
+static void handle_updatetracker(socket_t client, char *line) {
+    /* Expected: <updatetracker filename start_bytes end_bytes ip-address port-number>\n */
+    trim_angle(line);
+
+    char *tokens[32];
+    int nt = 0;
+    char *p = strtok(line, " ");
+    while (p && nt < 32) { tokens[nt++] = p; p = strtok(NULL, " "); }
+
+    if (nt < 6) {
+        send_all(client, "<updatetracker unknown fail>\n", strlen("<updatetracker unknown fail>\n"));
+        return;
+    }
+
+    const char *filename = tokens[1];
+    const char *start_b = tokens[2];
+    const char *end_b = tokens[3];
+    const char *ip = tokens[4];
+    const char *port = tokens[5];
+
+    char track_name[300];
+    size_t fl = strlen(filename);
+    if (fl >= 6 && strcmp(filename + fl - 6, ".track") == 0) {
+        snprintf(track_name, sizeof(track_name), "%s", filename);
+    } else {
+        snprintf(track_name, sizeof(track_name), "%s.track", filename);
+    }
+
+    ensure_tracker_dir();
+    char path[512];
+    tracker_path_for(track_name, path);
+
+    if (!file_exists(path)) {
+        char ferr[512];
+        snprintf(ferr, sizeof(ferr), "<updatetracker %s ferr>\n", filename);
+        send_all(client, ferr, strlen(ferr));
+        return;
+    }
+
+    FILE *in = fopen(path, "rb");
+    if (!in) {
+        char fail[512];
+        snprintf(fail, sizeof(fail), "<updatetracker %s fail>\n", filename);
+        send_all(client, fail, strlen(fail));
+        return;
+    }
+
+    char tmp_path[560];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    FILE *out = fopen(tmp_path, "wb");
+    if (!out) {
+        fclose(in);
+        char fail[512];
+        snprintf(fail, sizeof(fail), "<updatetracker %s fail>\n", filename);
+        send_all(client, fail, strlen(fail));
+        return;
+    }
+
+    /* Rewrite tracker file and replace any existing entry for the same peer (ip+port). */
+    char file_line[4096];
+    int replaced = 0;
+    while (fgets(file_line, sizeof(file_line), in)) {
+        char ip_old[128], port_old[32], s_old[64], e_old[64], t_old[64];
+        if (sscanf(file_line, "peer %127s %31s %63s %63s %63s", ip_old, port_old, s_old, e_old, t_old) == 5) {
+            if (strcmp(ip_old, ip) == 0 && strcmp(port_old, port) == 0) {
+                fprintf(out, "peer %s %s %s %s %ld\n", ip, port, start_b, end_b, current_unix_time());
+                replaced = 1;
+            } else {
+                fputs(file_line, out);
+            }
+        } else if (sscanf(file_line, "peer %127s %31s", ip_old, port_old) == 2) {
+            /* Backward compatibility with older tracker entries without range/time. */
+            if (strcmp(ip_old, ip) == 0 && strcmp(port_old, port) == 0) {
+                fprintf(out, "peer %s %s %s %s %ld\n", ip, port, start_b, end_b, current_unix_time());
+                replaced = 1;
+            } else {
+                fputs(file_line, out);
+            }
+        } else {
+            fputs(file_line, out);
+        }
+    }
+
+    if (!replaced) {
+        fprintf(out, "peer %s %s %s %s %ld\n", ip, port, start_b, end_b, current_unix_time());
+    }
+
+    fclose(in);
+    fclose(out);
+
+    if (remove(path) != 0 || rename(tmp_path, path) != 0) {
+        remove(tmp_path);
+        char fail[512];
+        snprintf(fail, sizeof(fail), "<updatetracker %s fail>\n", filename);
+        send_all(client, fail, strlen(fail));
+        return;
+    }
+
+    char succ[512];
+    snprintf(succ, sizeof(succ), "<updatetracker %s succ>\n", filename);
+    send_all(client, succ, strlen(succ));
 }
 
 static int read_entire_file(const char *path, char **out_buf, size_t *out_len) {
@@ -497,6 +576,8 @@ int main(void) {
                 handle_get(client_sock, line);
             } else if (strstr(line, "createtracker") != NULL || strstr(line, "CREATETRACKER") != NULL) {
                 handle_createtracker(client_sock, line);
+            } else if (strstr(line, "updatetracker") != NULL || strstr(line, "UPDATETRACKER") != NULL) {
+                handle_updatetracker(client_sock, line);
             }
         }
 
@@ -507,122 +588,3 @@ int main(void) {
     WSACleanup();
     return EXIT_SUCCESS;
 }
-
-#else  /* POSIX implementation */
-
-/*
- * POSIX tracker skeleton:
- *  - Creates a TCP listening socket.
- *  - Accepts incoming connections in a loop.
- *  - Forks a child process per client and dispatches to peer_handler().
- */
-int main(void) {
-    pid_t pid;
-    struct sockaddr_in server_addr, client_addr;
-    socket_t sockid, sock_child;
-    socklen_t clilen = sizeof(client_addr);
-
-    /* Create a TCP socket (IPv4, stream). */
-    sockid = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockid < 0) {
-        printf("socket cannot be created \n");
-        exit(0);
-    }
-
-    /* Bind the socket to a local port to listen for incoming connections. */
-    server_port = load_tracker_port_from_client_config();
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family      = AF_INET;               /* IPv4 */
-    server_addr.sin_port        = htons(server_port);    /* host to network byte order */
-    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);     /* listen on all interfaces */
-
-    if (bind(sockid, (struct sockaddr *) &server_addr, sizeof(server_addr)) == -1) {
-        printf("bind  failure\n");
-        exit(0);
-    }
-
-    printf("Tracker SERVER READY TO LISTEN INCOMING REQUEST.... \n");
-
-    /* Start listening; backlog size is arbitrary here (10). */
-    if (listen(sockid, 10) < 0) {
-        printf(" Tracker  SERVER CANNOT LISTEN\n");
-        exit(0);
-    }
-
-    /* Accept connections from clients in an infinite loop. */
-    while (1) {
-        sock_child = accept(sockid, (struct sockaddr *) &client_addr, &clilen);
-        if (sock_child < 0) {
-            printf("Tracker Cannot accept...\n");
-            exit(0);
-        }
-
-        /* Fork a child process to handle this particular client. */
-        pid = fork();
-        if (pid == 0) {
-            /* Child process: no need for the listening socket. */
-            CLOSESOCK(sockid);
-            peer_handler(sock_child);      /* Serve this client.           */
-            CLOSESOCK(sock_child);
-            exit(0);                       /* Child done.                  */
-        }
-
-        /* Parent process: close the connected socket, child is handling it. */
-        CLOSESOCK(sock_child);
-    }
-
-    /* Not reached in this skeleton. */
-    CLOSESOCK(sockid);
-    return 0;
-}
-
-
-/*
- * peer_handler:
- *  Child process function to handle a single connected peer.
- *  It:
- *   - Reads a single line/command from the client.
- *   - Dispatches to appropriate handler based on the protocol.
- */
-static void peer_handler(int sock_child) {
-    int length;
-
-    /* Read a command from the peer. */
-    length = (int) read(sock_child, read_msg, MAXLINE - 1);
-    if (length <= 0) {
-        return;
-    }
-    read_msg[length] = '\0';
-
-    /* LIST command received. */
-    if ((!strcmp(read_msg, "REQ LIST")) ||
-        (!strcmp(read_msg, "req list")) ||
-        (!strcmp(read_msg, "<REQ LIST>")) ||
-        (!strcmp(read_msg, "<REQ LIST>\n"))) {
-        /* TODO: implement handle_list_req(sock_child) according to the spec. */
-        /* handle_list_req(sock_child); */
-        printf("list request handled (skeleton).\n");
-    }
-    /* GET command received. */
-    else if ((strstr(read_msg, "get") != NULL) ||
-             (strstr(read_msg, "GET") != NULL)) {
-        /* TODO: xtrct_fname(read_msg, " ");              */
-        /* TODO: handle_get_req(sock_child, fname);       */
-    }
-    /* createtracker command received. */
-    else if ((strstr(read_msg, "createtracker")   != NULL) ||
-             (strstr(read_msg, "Createtracker")   != NULL) ||
-             (strstr(read_msg, "CREATETRACKER")   != NULL)) {
-        /* TODO: tokenize_createmsg(read_msg);            */
-        /* TODO: handle_createtracker_req(sock_child);    */
-    }
-    /* updatetracker command received. */
-    else if ((strstr(read_msg, "updatetracker")   != NULL) ||
-             (strstr(read_msg, "Updatetracker")   != NULL) ||
-             (strstr(read_msg, "UPDATETRACKER")   != NULL)) {
-        /* TODO: tokenize_updatemsg(read_msg);            */
-        /* TODO: handle_updatetracker_req(sock_child);    */
-    }
-}
-
-#endif  /* !_WIN32 */

@@ -1,19 +1,11 @@
 #
-# Cross‑platform Makefile for CS4390 P2P project skeleton
-# - On Linux / POSIX: builds peer and tracker using BSD sockets.
-# - On Windows (MinGW): builds peer using Winsock (links with -lws2_32).
+# Windows-only Makefile for CS4390 P2P project skeleton (MinGW)
+# Builds peer and tracker with Winsock2 support.
 #
-
-# Detect Windows vs non‑Windows to set Winsock library.
-ifeq ($(OS),Windows_NT)
-  WSLIB = -lws2_32
-else
-  WSLIB =
-endif
 
 CC      = gcc
 CFLAGS  = -Wall -Wextra -g
-LDFLAGS = $(WSLIB)
+LDFLAGS = -lws2_32
 
 PEER_SRC    = skeleton_peer.c
 TRACKER_SRC = skeleton_tracker.c
@@ -21,22 +13,27 @@ TRACKER_SRC = skeleton_tracker.c
 PEER_OBJ    = $(PEER_SRC:.c=.o)
 TRACKER_OBJ = $(TRACKER_SRC:.c=.o)
 
-PEER_BIN    = peer
+PEER_DIRS   = peer1 peer2 peer3
+PEER_BINS   = $(PEER_DIRS:%=%/peer)
 TRACKER_BIN = tracker
+CLEAN_FILES = $(PEER_BINS:%=%.exe) $(TRACKER_BIN:%=%.exe) $(TRACKER_OBJ) $(PEER_OBJ)
 
 .PHONY: all clean
 
-all: $(PEER_BIN) $(TRACKER_BIN)
+all: $(PEER_BINS) $(TRACKER_BIN)
 
-$(PEER_BIN): $(PEER_OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+$(PEER_BINS): %/peer: $(PEER_OBJ) %
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 $(TRACKER_BIN): $(TRACKER_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(PEER_DIRS):
+	mkdir $@
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(PEER_BIN) $(TRACKER_BIN) $(PEER_OBJ) $(TRACKER_OBJ)
+	-cmd /C del /Q /F $(subst /,\,$(CLEAN_FILES))
 

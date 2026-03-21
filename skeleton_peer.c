@@ -2,47 +2,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * Cross‑platform socket includes and typedefs.
- * - On Windows (MinGW / MSVC), use Winsock2 and call WSAStartup/WSACleanup.
- * - On Linux / POSIX, use BSD socket headers.
- */
-#ifdef _WIN32
-  #ifndef WIN32_LEAN_AND_MEAN
-    #define WIN32_LEAN_AND_MEAN
-  #endif
-  #include <winsock2.h>
-  #include <ws2tcpip.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
-  /* Link with Winsock library when using MSVC.
-   * With MinGW, the Makefile will add -lws2_32 instead. */
-  #ifdef _MSC_VER
-    #pragma comment(lib, "Ws2_32.lib")
-  #endif
-
-  typedef SOCKET socket_t;
-  #define CLOSESOCK(s) closesocket(s)
-#else
-  #include <unistd.h>
-  #include <sys/types.h>
-  #include <sys/socket.h>
-  #include <netinet/in.h>
-  #include <arpa/inet.h>
-
-  typedef int socket_t;
-  #define CLOSESOCK(s) close(s)
+/* Link with Winsock library when using MSVC.
+ * With MinGW, the Makefile links using -lws2_32. */
+#ifdef _MSC_VER
+#pragma comment(lib, "Ws2_32.lib")
 #endif
 
-/* NOTE:
- * The assignment skeleton assumes the existence of a LIST constant and a msg buffer to receive the server reply.
- * Here we declare minimal placeholders so the file compiles.
- * TODO: replace these with the real protocol structures that follow the project design.
- */
-#ifndef LIST
-#define LIST 1
-#endif
-
-static int msg = 0;
+typedef SOCKET socket_t;
+#define CLOSESOCK(s) closesocket(s)
 
 /* Configuration values */
 #define MAX_PATH_LEN 260
@@ -154,6 +127,28 @@ static void trim_eol(char *s) {
     }
 }
 
+static void print_usage(const char *prog) {
+    fprintf(stderr,
+        "Usage:\n"
+        "  %s list\n"
+        "  %s get <filename.track>\n"
+        "  %s createtracker <filename> <filesize> <description_no_spaces> <md5>\n"
+        "  %s updatetracker <filename> <start_byte> <end_byte>\n",
+        prog, prog, prog, prog);
+}
+
+static void get_local_ip_for_socket(socket_t sock, char *out, size_t out_sz) {
+    struct sockaddr_in local_addr;
+    int len = (int)sizeof(local_addr);
+    if (getsockname(sock, (struct sockaddr *)&local_addr, &len) == 0) {
+        if (inet_ntop(AF_INET, &local_addr.sin_addr, out, (DWORD)out_sz) != NULL) {
+            return;
+        }
+    }
+    strncpy(out, "127.0.0.1", out_sz - 1);
+    out[out_sz - 1] = '\0';
+}
+
 int main(int argc, char *argv[]) {
     char server_address[64];
     load_client_config();
@@ -165,7 +160,6 @@ int main(int argc, char *argv[]) {
     printf("Tracker: %s:%d, Peer listen: %d, Shared: %s, Interval: %d\n",
         tracker_ip, tracker_port, peer_listen_port, shared_folder, refresh_interval);
 
-#ifdef _WIN32
     /* Initialize Winsock once before using any socket API on Windows. */
     WSADATA wsa_data;
     int wsa_err = WSAStartup(MAKEWORD(2, 2), &wsa_data);
@@ -173,19 +167,12 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "WSAStartup failed with error %d\n", wsa_err);
         return EXIT_FAILURE;
     }
-#endif
 
     /* Create a TCP socket (IPv4, stream). */
     sockid = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockid == (socket_t) -1
-#ifdef _WIN32
-        || sockid == INVALID_SOCKET
-#endif
-    ) {
+    if (sockid == INVALID_SOCKET) {
         fprintf(stderr, "socket cannot be created\n");
-#ifdef _WIN32
         WSACleanup();
-#endif
         return EXIT_FAILURE;
     }
 
@@ -200,9 +187,7 @@ int main(int argc, char *argv[]) {
     if (inet_pton(AF_INET, server_address, &server_addr.sin_addr) <= 0) {
         fprintf(stderr, "Invalid server address: %s\n", server_address);
         CLOSESOCK(sockid);
-#ifdef _WIN32
         WSACleanup();
-#endif
         return EXIT_FAILURE;
     }
 
@@ -210,11 +195,12 @@ int main(int argc, char *argv[]) {
     if (connect(sockid, (struct sockaddr *) &server_addr, sizeof(server_addr)) < 0) {
         fprintf(stderr, "Cannot connect to server\n");
         CLOSESOCK(sockid);
-#ifdef _WIN32
         WSACleanup();
-#endif
         return EXIT_FAILURE;
     }
+
+    char local_ip[64];
+    get_local_ip_for_socket(sockid, local_ip, sizeof(local_ip));
 
     if (argc > 1 && !strcmp(argv[1], "list")) {
         /* Send LIST request to the tracker. */
@@ -222,9 +208,7 @@ int main(int argc, char *argv[]) {
         if (send_all(sockid, req, strlen(req)) != 0) {
             fprintf(stderr, "Send <REQ LIST> failure\n");
             CLOSESOCK(sockid);
-#ifdef _WIN32
             WSACleanup();
-#endif
             return EXIT_FAILURE;
         }
 
@@ -235,23 +219,88 @@ int main(int argc, char *argv[]) {
             if (n <= 0) {
                 fprintf(stderr, "Read LIST reply failure\n");
                 CLOSESOCK(sockid);
-#ifdef _WIN32
                 WSACleanup();
-#endif
                 return EXIT_FAILURE;
             }
             trim_eol(line);
             printf("%s\n", line);
             if (!strcmp(line, "<REP LIST END>")) break;
         }
+    } else if (argc > 2 && !strcmp(argv[1], "get")) {
+        char req[512];
+        snprintf(req, sizeof(req), "<GET %s >\n", argv[2]);
+        if (send_all(sockid, req, strlen(req)) != 0) {
+            fprintf(stderr, "Send GET failure\n");
+            CLOSESOCK(sockid);
+            WSACleanup();
+            return EXIT_FAILURE;
+        }
+
+        /* Print GET response until REP GET END is received. */
+        char line[4096];
+        for (;;) {
+            int n = recv_line(sockid, line, sizeof(line));
+            if (n <= 0) {
+                fprintf(stderr, "Read GET reply failure\n");
+                CLOSESOCK(sockid);
+                WSACleanup();
+                return EXIT_FAILURE;
+            }
+            trim_eol(line);
+            printf("%s\n", line);
+            if (strstr(line, "<REP GET END ") == line) break;
+        }
+    } else if (argc > 5 && !strcmp(argv[1], "createtracker")) {
+        /* Uses local peer_listen_port from serverThreadConfig.cfg as required by protocol. */
+        char req[1024];
+        snprintf(req, sizeof(req), "<createtracker %s %s %s %s %s %d>\n",
+                 argv[2], argv[3], argv[4], argv[5], local_ip, peer_listen_port);
+        if (send_all(sockid, req, strlen(req)) != 0) {
+            fprintf(stderr, "Send createtracker failure\n");
+            CLOSESOCK(sockid);
+            WSACleanup();
+            return EXIT_FAILURE;
+        }
+
+        char line[4096];
+        int n = recv_line(sockid, line, sizeof(line));
+        if (n <= 0) {
+            fprintf(stderr, "Read createtracker reply failure\n");
+            CLOSESOCK(sockid);
+            WSACleanup();
+            return EXIT_FAILURE;
+        }
+        trim_eol(line);
+        printf("%s\n", line);
+    } else if (argc > 4 && !strcmp(argv[1], "updatetracker")) {
+        char req[1024];
+        snprintf(req, sizeof(req), "<updatetracker %s %s %s %s %d>\n",
+                 argv[2], argv[3], argv[4], local_ip, peer_listen_port);
+        if (send_all(sockid, req, strlen(req)) != 0) {
+            fprintf(stderr, "Send updatetracker failure\n");
+            CLOSESOCK(sockid);
+            WSACleanup();
+            return EXIT_FAILURE;
+        }
+
+        char line[4096];
+        int n = recv_line(sockid, line, sizeof(line));
+        if (n <= 0) {
+            fprintf(stderr, "Read updatetracker reply failure\n");
+            CLOSESOCK(sockid);
+            WSACleanup();
+            return EXIT_FAILURE;
+        }
+        trim_eol(line);
+        printf("%s\n", line);
+    } else {
+        print_usage(argv[0]);
     }
 
     CLOSESOCK(sockid);
     printf("Connection closed\n");
 
-#ifdef _WIN32
     WSACleanup();
-#endif
 
     return EXIT_SUCCESS;
 }
