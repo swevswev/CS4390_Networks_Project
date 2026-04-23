@@ -544,12 +544,16 @@ static unsigned __stdcall tracker_client_thread(void *arg) {
     if (n > 0) {
         EnterCriticalSection(&g_tracker_fs_lock);
         if (strstr(line, "REQ LIST") != NULL) {
+            printf("Received LIST request\n");
             handle_list(client_sock);
         } else if (strstr(line, "GET") != NULL || strstr(line, "get") != NULL) {
+            printf("Received GET request\n");
             handle_get(client_sock, line);
         } else if (strstr(line, "createtracker") != NULL || strstr(line, "CREATETRACKER") != NULL) {
+            printf("Received CREATE TRACKER request\n");
             handle_createtracker(client_sock, line);
         } else if (strstr(line, "updatetracker") != NULL || strstr(line, "UPDATETRACKER") != NULL) {
+            printf("Received UPDATE TRACKER request\n");
             handle_updatetracker(client_sock, line);
         }
         LeaveCriticalSection(&g_tracker_fs_lock);
