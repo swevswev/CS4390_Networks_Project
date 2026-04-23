@@ -672,11 +672,11 @@ static unsigned __stdcall refresh_thread(void *unused) {
         int saw_end = 0;
         while (recv_line(sock, line, sizeof(line)) > 0) {
             trim_eol(line);
-            if (strstr(line, "<REP LIST ") == line) {
-                sscanf(line, "<REP LIST %d>", &expect_num);
-            } else if (strstr(line, "<REP LIST END>") == line) {
+            if (strstr(line, "<REP LIST END>") == line) {
                 saw_end = 1;
                 break;
+            } else if (strstr(line, "<REP LIST ") == line) {
+                sscanf(line, "<REP LIST %d>", &expect_num);
             } else if (num_available_files < 100 && expect_num > 0 && sscanf(line, "<%*d %255s %ld %32s>", available_files[num_available_files].name, &available_files[num_available_files].size, available_files[num_available_files].md5) == 3) {
                 printf("[refresh] Found %s size=%ld md5=%s\n", available_files[num_available_files].name, available_files[num_available_files].size, available_files[num_available_files].md5);
                 num_available_files++;
