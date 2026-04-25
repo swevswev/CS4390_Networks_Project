@@ -11,6 +11,9 @@
 #include <process.h>
 #include <stdint.h>
 #include <time.h>
+#include <io.h>
+#include <errno.h>
+#include <ctype.h>
 
 /* Link with Winsock library when using MSVC.
  * With MinGW, the Makefile links using -lws2_32. */
@@ -18,8 +21,22 @@
 #pragma comment(lib, "Ws2_32.lib")
 #endif
 
+/* ---------------------------------------------------------------------------
+ * CS 4390 — Course project (see project description PDF, “Project Specification”):
+ * - Central tracker keeps .track files; protocol: LIST, GET, createtracker, updatetracker.
+ * - Tracker file layout: filename/size/description/MD5 (with comments/peer list lines).
+ * - Peers: max P2P chunk 1024 bytes; after a successful GET of a .track from the tracker,
+ *   verify the MD5 in <REP …>, cache the tracker data, then download file bytes from peers.
+ *   Choose segments sequentially; prefer the peer with the newest timestamp for a segment
+ *   (per spec); call updatetracker after each complete segment. Resume partial downloads
+ *   from shared storage; delete the cached .track on successful full data transfer.
+ * -------------------------------------------------------------------------- */
+
 typedef SOCKET socket_t;
 #define CLOSESOCK(s) closesocket(s)
+#define MAX_P2P_CHUNK 1024
+#define MAX_TRACK_PEERS 64
+#define P2P_DOWNLOAD_WORKERS 4
 
 /* Configuration values */
 #define MAX_PATH_LEN 260
@@ -133,6 +150,72 @@ static int recv_line(socket_t sock, char *out, size_t cap) {
     }
     out[used] = '\0';
     return (int)used;
+}
+
+static int parse_nonneg_long(const char *tok, long *out) {
+    char *endp = NULL;
+    long v;
+    if (!tok || !*tok) return 0;
+    v = strtol(tok, &endp, 10);
+    if (*endp != '\0' || v < 0) return 0;
+    *out = v;
+    return 1;
+}
+
+static int filename_is_safe_token(const char *name) {
+    if (!name || !*name) return 0;
+    if (strchr(name, '/') || strchr(name, '\\')) return 0;
+    if (strstr(name, "..")) return 0;
+    if (strchr(name, ' ')) return 0;
+    return 1;
+}
+
+/*
+ * Accepted P2P request forms (single line):
+ *   <GET filename start end>
+ *   <GET filename start +chunksize>
+ *
+ * Notes:
+ * - Indices are byte offsets, inclusive of both start and end.
+ * - "+chunksize" form starts at "start" and returns exactly chunksize bytes.
+ * - Any requested size > MAX_P2P_CHUNK is rejected with "<GET invalid>\n".
+ */
+static int parse_peer_get_request(const char *line, char *filename, size_t filename_sz,
+                                  long *start_out, long *size_out, int *size_too_large) {
+    char cmd[16], file_tok[256], tok3[64], tok4[64], extra[8];
+    long start, end_or_size, req_size;
+    int fields;
+
+    *size_too_large = 0;
+    fields = sscanf(line, " <%15s %255s %63s %63s %7s", cmd, file_tok, tok3, tok4, extra);
+    if (fields != 4) return -1;
+    {
+        size_t n4 = strlen(tok4);
+        if (n4 > 0 && tok4[n4 - 1] == '>') tok4[n4 - 1] = '\0';
+    }
+    if (strcmp(cmd, "GET") != 0) return -1;
+    if (!filename_is_safe_token(file_tok)) return -1;
+    if (!parse_nonneg_long(tok3, &start)) return -1;
+
+    if (tok4[0] == '+') {
+        if (!parse_nonneg_long(tok4 + 1, &end_or_size) || end_or_size <= 0) return -1;
+        req_size = end_or_size;
+    } else {
+        if (!parse_nonneg_long(tok4, &end_or_size)) return -1;
+        if (end_or_size < start) return -1;
+        req_size = (end_or_size - start) + 1;
+    }
+
+    if (req_size > MAX_P2P_CHUNK) {
+        *size_too_large = 1;
+        return -1;
+    }
+
+    strncpy(filename, file_tok, filename_sz - 1);
+    filename[filename_sz - 1] = '\0';
+    *start_out = start;
+    *size_out = req_size;
+    return 0;
 }
 
 static void trim_eol(char *s) {
@@ -357,6 +440,16 @@ static int compute_file_md5(const char *path, char md5_out[33], long *size_out) 
     return 0;
 }
 
+/* In-progress downloads and chunk maps live in sharedFolder; never register or updatetracker them. */
+static int is_download_auxiliary_filename(const char *name) {
+    size_t n;
+    if (!name || !*name) return 1;
+    n = strlen(name);
+    if (n >= 5 && _stricmp(name + n - 5, ".part") == 0) return 1;
+    if (n >= 9 && _stricmp(name + n - 9, ".chunkmap") == 0) return 1;
+    return 0;
+}
+
 static int scan_shared_folder_to_list(struct LocalFile *files, int *count_out) {
     if (ensure_shared_folder() != 0) {
         fprintf(stderr, "[monitor] cannot access shared folder '%s'\n", shared_folder);
@@ -381,6 +474,7 @@ static int scan_shared_folder_to_list(struct LocalFile *files, int *count_out) {
     int count = 0;
     do {
         if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (is_download_auxiliary_filename(ffd.cFileName)) continue;
         if (count >= 50) break;
 
         if (!file_path_join(shared_folder, ffd.cFileName, files[count].path, sizeof(files[count].path))) {
@@ -406,6 +500,8 @@ static int find_local_file_by_name(const char *name, const struct LocalFile *fil
     }
     return -1;
 }
+
+static const char *peer_log_id(void);
 
 static void sanitize_tracker_token(char *out, const char *in, size_t out_sz) {
     size_t i;
@@ -437,22 +533,44 @@ static int send_tracker_createtracker(const char *filename, long filesize, const
     trim_eol(line);
 
     if (strstr(line, "<createtracker succ>") || strstr(line, "<createtracker ferr>")) {
+        /* Project spec style: Peer1: createtracker movie1.avi 10 description md5 ip port */
+        printf("%s: createtracker %s %ld %s %s %s %d\n",
+               peer_log_id(), filename, filesize, desc, md5, local_ip, peer_listen_port);
         return 0;
     }
     return -1;
+}
+
+static int send_tracker_updatetracker(const char *filename, long start_b, long end_b, const char *local_ip) {
+    socket_t sock;
+    if (connect_to_tracker(&sock) != 0) return -1;
+
+    char req[1024];
+    int len = snprintf(req, sizeof(req), "<updatetracker %s %ld %ld %s %d>\n",
+                       filename, start_b, end_b, local_ip, peer_listen_port);
+    if (len < 0 || len >= (int)sizeof(req) || send_all(sock, req, strlen(req)) != 0) {
+        CLOSESOCK(sock);
+        return -1;
+    }
+
+    char line[4096];
+    int n = recv_line(sock, line, sizeof(line));
+    CLOSESOCK(sock);
+    if (n <= 0) return -1;
+    trim_eol(line);
+    return strstr(line, " succ>") != NULL ? 0 : -1;
 }
 
 static void register_local_files(void) {
     for (int i = 0; i < num_local_files; i++) {
         const char *name = base_name(local_files[i].path);
         if (strchr(name, ' ')) {
-            printf("[auto] skipping file with spaces: %s\n", name);
+            printf("%s: createtracker skipped (spaces in name) %s\n", peer_log_id(), name);
             continue;
         }
 
-        printf("[auto] registering %s size=%ld md5=%s\n", name, local_files[i].size, local_files[i].md5);
         if (send_tracker_createtracker(name, local_files[i].size, local_files[i].md5, g_local_ip) != 0) {
-            printf("[auto] tracker registration failed for %s\n", name);
+            printf("%s: createtracker failed for %s\n", peer_log_id(), name);
         }
     }
 }
@@ -476,9 +594,9 @@ static void update_local_files_from_scan(void) {
             if (strchr(name, ' ')) {
                 printf("[monitor] skipping tracker registration for file with spaces: %s\n", name);
             } else if (send_tracker_createtracker(name, new_files[i].size, new_files[i].md5, g_local_ip) == 0) {
-                printf("[monitor] registered new file %s with tracker\n", name);
+                /* createtracker line printed inside send_tracker_createtracker */
             } else {
-                printf("[monitor] failed to register new file %s\n", name);
+                printf("%s: createtracker failed for %s\n", peer_log_id(), name);
             }
         } else if (!local_files_equal(&new_files[i], &local_files[idx])) {
             printf("[monitor] changed file detected: %s\n", name);
@@ -487,6 +605,27 @@ static void update_local_files_from_scan(void) {
 
     memcpy(local_files, new_files, sizeof(new_files));
     num_local_files = new_count;
+}
+
+/*
+ * Periodically refresh this peer's ownership ranges for all currently shared files.
+ * We use the full-file range [0, size-1] for non-empty files, and [0,0] for empty files.
+ */
+static void send_periodic_updatetracker_for_local_files(void) {
+    struct LocalFile snapshot[50];
+    int snapshot_count = 0;
+    if (scan_shared_folder_to_list(snapshot, &snapshot_count) != 0) return;
+
+    for (int i = 0; i < snapshot_count; i++) {
+        const char *name = base_name(snapshot[i].path);
+        long start_b = 0;
+        long end_b = (snapshot[i].size > 0) ? (snapshot[i].size - 1) : 0;
+        if (strchr(name, ' ')) continue;
+
+        if (send_tracker_updatetracker(name, start_b, end_b, g_local_ip) != 0) {
+            printf("%s: updatetracker failed for %s\n", peer_log_id(), name);
+        }
+    }
 }
 
 static unsigned __stdcall monitor_thread(void *unused) {
@@ -519,11 +658,73 @@ static unsigned __stdcall peer_client_thread(void *arg) {
     char line[4096];
     int n = recv_line(client, line, sizeof(line));
     if (n > 0) {
+        char req_name[256];
+        char full_path[MAX_PATH_LEN];
+        char response[64];
+        long start = 0;
+        long req_size = 0;
+        int too_large = 0;
+
         trim_eol(line);
         printf("[peer-server] request: %s\n", line);
-        /* Stub: real P2P chunk GET / 1024-byte limit comes later; keep connection protocol-friendly. */
-        const char *stub = "<peer p2p stub: not implemented>\n";
-        (void)send_all(client, stub, strlen(stub));
+
+        if (parse_peer_get_request(line, req_name, sizeof(req_name), &start, &req_size, &too_large) != 0) {
+            if (too_large) {
+                (void)send_all(client, "<GET invalid>\n", strlen("<GET invalid>\n"));
+            } else {
+                (void)send_all(client, "<GET error>\n", strlen("<GET error>\n"));
+            }
+            CLOSESOCK(client);
+            return 0;
+        }
+
+        if (!file_path_join(shared_folder, req_name, full_path, sizeof(full_path))) {
+            (void)send_all(client, "<GET error>\n", strlen("<GET error>\n"));
+            CLOSESOCK(client);
+            return 0;
+        }
+
+        FILE *f = fopen(full_path, "rb");
+        if (!f) {
+            (void)send_all(client, "<GET error>\n", strlen("<GET error>\n"));
+            CLOSESOCK(client);
+            return 0;
+        }
+
+        if (fseek(f, 0, SEEK_END) != 0) {
+            fclose(f);
+            (void)send_all(client, "<GET error>\n", strlen("<GET error>\n"));
+            CLOSESOCK(client);
+            return 0;
+        }
+        long file_size = ftell(f);
+        if (file_size < 0 || start > file_size || req_size <= 0 || (start + req_size) > file_size) {
+            fclose(f);
+            (void)send_all(client, "<GET error>\n", strlen("<GET error>\n"));
+            CLOSESOCK(client);
+            return 0;
+        }
+        if (fseek(f, start, SEEK_SET) != 0) {
+            fclose(f);
+            (void)send_all(client, "<GET error>\n", strlen("<GET error>\n"));
+            CLOSESOCK(client);
+            return 0;
+        }
+
+        char chunk[MAX_P2P_CHUNK];
+        size_t got = fread(chunk, 1, (size_t)req_size, f);
+        fclose(f);
+        if ((long)got != req_size) {
+            (void)send_all(client, "<GET error>\n", strlen("<GET error>\n"));
+            CLOSESOCK(client);
+            return 0;
+        }
+
+        snprintf(response, sizeof(response), "<GET ok %ld>\n", req_size);
+        if (send_all(client, response, strlen(response)) != 0 || send_all(client, chunk, got) != 0) {
+            CLOSESOCK(client);
+            return 0;
+        }
     }
 
     CLOSESOCK(client);
@@ -645,19 +846,496 @@ static int connect_to_tracker(socket_t *sock_out) {
     return 0;
 }
 
+/* --- Auto download (see project spec: GET .track, P2P chunks, updatetracker, resume) --- */
+
+static const char *peer_log_id(void) {
+    const char *e = getenv("PEER_ID");
+    return (e && *e) ? e : "peer";
+}
+
+struct PeerInfo {
+    char ip[64];
+    int port;
+    long start, end, ts;
+};
+
+static int read_full_tracker_response(socket_t s, char **buf_out, size_t *len_out) {
+    size_t cap = 65536, len = 0;
+    char *buf = (char *)malloc(cap + 1);
+    if (!buf) return -1;
+    for (;;) {
+        if (len + 16384 > cap) {
+            size_t ncap = cap * 2;
+            char *nbuf = (char *)realloc(buf, ncap + 1);
+            if (!nbuf) { free(buf); return -1; }
+            buf = nbuf;
+            cap = ncap;
+        }
+        size_t room = cap - len;
+        int chunk = (int)((room < 16384) ? room : 16384);
+        if (chunk <= 0) { free(buf); return -1; }
+        int n = recv(s, buf + len, chunk, 0);
+        if (n < 0) { free(buf); return -1; }
+        if (n == 0) break;
+        len += (size_t)n;
+    }
+    buf[len] = '\0';
+    *buf_out = buf;
+    *len_out = len;
+    return 0;
+}
+
+/* Validate wire format from tracker (project spec: <REP GET BEGIN>, body, <REP END FileMD5>). */
+static int parse_tracker_get_payload(const char *buf, char **body_out, size_t *body_len,
+                                     char end_md5_hex[33]) {
+    const char *begin_mark = "<REP GET BEGIN>\n";
+    const char *h = strstr(buf, begin_mark);
+    if (!h) return -1;
+    const char *p = h + strlen(begin_mark); /* body starts immediately after this line */
+    /* Trailer is "<REP GET END md5>\n" with no extra newline when the .track already ends in '\n',
+     * so "\n<REP GET END " must not be used as the body boundary (it steals the file's final LF). */
+    const char *endmark = NULL;
+    for (const char *q = strstr(p, "<REP GET END "); q; q = strstr(q + 1, "<REP GET END "))
+        endmark = q;
+    if (!endmark) {
+        return -1;
+    }
+    *body_len = (size_t)(endmark - p);
+    *body_out = (char *)malloc(*body_len + 1);
+    if (!*body_out) return -1;
+    memcpy(*body_out, p, *body_len);
+    (*body_out)[*body_len] = '\0';
+    {
+        if (sscanf(endmark, "<REP GET END %32[0-9a-fA-F]>", end_md5_hex) != 1) {
+            free(*body_out);
+            *body_out = NULL;
+            return -1;
+        }
+    }
+    {
+        char calc[33];
+        md5_bytes_hex(*body_out, *body_len, calc);
+        for (int i = 0; i < 32; i++) {
+            char a = (char)tolower((unsigned char)end_md5_hex[i]);
+            char b = (char)tolower((unsigned char)calc[i]);
+            if (a != b) {
+                free(*body_out);
+                *body_out = NULL;
+                return -1;
+            }
+        }
+    }
+    end_md5_hex[32] = '\0';
+    return 0;
+}
+
+static int get_tracker_file_via_get(const char *track_filename, char **body_out, size_t *body_len) {
+    socket_t s;
+    if (connect_to_tracker(&s) != 0) return -1;
+    char req[600];
+    int ln = snprintf(req, sizeof(req), "<GET %s >\n", track_filename);
+    if (ln < 0 || ln >= (int)sizeof(req) || send_all(s, req, (size_t)ln) != 0) {
+        CLOSESOCK(s);
+        return -1;
+    }
+    char *raw = NULL;
+    size_t rawlen = 0;
+    if (read_full_tracker_response(s, &raw, &rawlen) != 0) {
+        CLOSESOCK(s);
+        return -1;
+    }
+    CLOSESOCK(s);
+    char *body = NULL;
+    size_t blen = 0;
+    char endmd5[33];
+    if (parse_tracker_get_payload(raw, &body, &blen, endmd5) != 0) {
+        free(raw);
+        fprintf(stderr, "[%s] GET %s: bad response or MD5 mismatch\n", peer_log_id(), track_filename);
+        return -1;
+    }
+    free(raw);
+    *body_out = body;
+    *body_len = blen;
+    return 0;
+}
+
+/* Tracker file: lines like "filename ...", "filesize ...", "md5 ...", "peer ..." (see project spec). */
+static int parse_track_text(const char *text, char *filename_out, long *filesize_out,
+                            char data_md5_out[33], struct PeerInfo *peers, int *npeers_out) {
+    char copy[16000];
+    if (strlen(text) >= sizeof(copy)) return -1;
+    strncpy(copy, text, sizeof(copy) - 1);
+    copy[sizeof(copy) - 1] = '\0';
+    *npeers_out = 0;
+    filename_out[0] = '\0';
+    *filesize_out = 0;
+    data_md5_out[0] = '\0';
+    char *line = copy;
+    while (line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        while (*line == ' ' || *line == '\t' || *line == '\r') line++;
+        if (line[0] == '\0' || line[0] == '#') {
+            if (nl) line = nl + 1; else break;
+            continue;
+        }
+        if (_strnicmp(line, "filename", 8) == 0) {
+            const char *v = line + 8;
+            while (*v == ' ' || *v == '\t' || *v == ':') v++;
+            strncpy(filename_out, v, 255);
+            filename_out[255] = '\0';
+        } else if (_strnicmp(line, "filesize", 8) == 0) {
+            const char *v = line + 8;
+            while (*v == ' ' || *v == '\t' || *v == ':') v++;
+            *filesize_out = atol(v);
+        } else if (_strnicmp(line, "md5", 3) == 0) {
+            const char *v = line + 3;
+            while (*v == ' ' || *v == '\t' || *v == ':') v++;
+            char tok[64];
+            if (sscanf(v, "%63s", tok) == 1) {
+                if (strlen(tok) == 32) { memcpy(data_md5_out, tok, 32); data_md5_out[32] = '\0'; }
+            }
+        } else if (_strnicmp(line, "peer", 4) == 0) {
+            if (*npeers_out < MAX_TRACK_PEERS) {
+                const char *v = line + 4;
+                while (*v == ' ' || *v == '\t') v++;
+                int po;
+                long st, en, tss;
+                if (sscanf(v, " %63[^:]:%d:%ld:%ld:%ld", peers[*npeers_out].ip, &po, &st, &en, &tss) == 5) {
+                    peers[*npeers_out].port = po;
+                    peers[*npeers_out].start = st;
+                    peers[*npeers_out].end = en;
+                    peers[*npeers_out].ts = tss;
+                    (*npeers_out)++;
+                }
+            }
+        }
+        if (nl) line = nl + 1; else break;
+    }
+    if (!filename_out[0] || *filesize_out < 0 || strlen(data_md5_out) != 32) return -1;
+    return 0;
+}
+
+static int is_self_seeder(const char *ip, int port) {
+    if (port != peer_listen_port) return 0;
+    if (_stricmp(ip, g_local_ip) == 0) return 1;
+    if (strcmp(g_local_ip, "127.0.0.1") == 0 && _stricmp(ip, "127.0.0.1") == 0) return 1;
+    return 0;
+}
+
+static int best_peer_index(struct PeerInfo *peers, int n, long cstart, long cend) {
+    int best = -1;
+    long best_ts = -1;
+    for (int i = 0; i < n; i++) {
+        if (is_self_seeder(peers[i].ip, peers[i].port)) continue;
+        if (peers[i].start > cstart || peers[i].end < cend) continue;
+        if (peers[i].ts > best_ts) {
+            best_ts = peers[i].ts;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static int recv_exact(socket_t s, void *b, size_t n) {
+    char *p = (char *)b;
+    size_t o = 0;
+    while (o < n) {
+        int r = recv(s, p + o, (int)(n - o), 0);
+        if (r <= 0) return -1;
+        o += (size_t)r;
+    }
+    return 0;
+}
+
+static int p2p_get_chunk(const char *ip, int prt, const char *fname, long start, long clen, char *out) {
+    struct sockaddr_in a;
+    socket_t s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) return -1;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)prt);
+    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) { CLOSESOCK(s); return -1; }
+    if (connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) { CLOSESOCK(s); return -1; }
+    char req[512];
+    int len = snprintf(req, sizeof(req), "<GET %s %ld +%ld>\n", fname, start, clen);
+    if (len < 0 || len >= (int)sizeof(req) || send_all(s, req, (size_t)len) != 0) {
+        CLOSESOCK(s);
+        return -1;
+    }
+    char line[512];
+    if (recv_line(s, line, sizeof(line)) <= 0) { CLOSESOCK(s); return -1; }
+    trim_eol(line);
+    long nexpect = 0;
+    if (sscanf(line, "<GET ok %ld", &nexpect) != 1) { CLOSESOCK(s); return -1; }
+    if (nexpect != (long)clen) { CLOSESOCK(s); return -1; }
+    if (recv_exact(s, out, (size_t)clen) != 0) { CLOSESOCK(s); return -1; }
+    CLOSESOCK(s);
+    return 0;
+}
+
+static int ensure_track_cache_dir(char *out, size_t out_sz) {
+    if (!file_path_join(shared_folder, "tracker_cache", out, out_sz)) return -1;
+    if (GetFileAttributesA(out) == INVALID_FILE_ATTRIBUTES) {
+        if (CreateDirectoryA(out, NULL) == 0 && GetLastError() != ERROR_ALREADY_EXISTS) return -1;
+    }
+    return 0;
+}
+
+static int chunk_bit_test(const unsigned char *map, int idx) {
+    return (map[idx / 8] >> (idx % 8)) & 1;
+}
+static void chunk_bit_set(unsigned char *map, int idx) {
+    map[idx / 8] |= (unsigned char)(1u << (idx % 8));
+}
+static int chunk_bytes(int nchunk) { return (nchunk + 7) / 8; }
+
+static int save_map_file(const char *path, const unsigned char *map, int nbytes) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    if (fwrite(map, 1, (size_t)nbytes, f) != (size_t)nbytes) { fclose(f); return -1; }
+    fclose(f);
+    return 0;
+}
+static int load_map_file(const char *path, unsigned char *map, int nbytes) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fread(map, 1, (size_t)nbytes, f) != (size_t)nbytes) { fclose(f); return -1; }
+    fclose(f);
+    return 0;
+}
+
+typedef struct {
+    char fname[300];
+    char part_path[MAX_PATH_LEN];
+    char map_path[MAX_PATH_LEN];
+    char track_cache_path[MAX_PATH_LEN];
+    long filesize;
+    int nchunks;
+    unsigned char *map;
+    int map_nbytes;
+    struct PeerInfo peers[MAX_TRACK_PEERS];
+    int npeers;
+    char expect_md5[33];
+    FILE *fpart;
+    CRITICAL_SECTION cs;
+    volatile int failed;
+} DlState;
+
+static unsigned __stdcall dl_worker(void *arg) {
+    DlState *d = (DlState *)arg;
+    for (;;) {
+        int chunk = -1;
+        EnterCriticalSection(&d->cs);
+        for (int k = 0; k < d->nchunks; k++) {
+            if (!chunk_bit_test(d->map, k)) {
+                chunk = k;
+                chunk_bit_set(d->map, k);
+                break;
+            }
+        }
+        LeaveCriticalSection(&d->cs);
+        if (chunk < 0) return 0;
+        if (d->failed) return 0;
+        long start = (long)chunk * MAX_P2P_CHUNK;
+        long clen = d->filesize - start;
+        if (clen > MAX_P2P_CHUNK) clen = MAX_P2P_CHUNK;
+        if (clen <= 0) { d->failed = 1; return 0; }
+        long cend = start + clen - 1;
+        int try_count = 0;
+        int ok = 0;
+        char buf[MAX_P2P_CHUNK];
+        while (try_count < 8 && !ok) {
+            int pi = best_peer_index(d->peers, d->npeers, start, cend);
+            if (pi < 0) {
+                Sleep(200);
+                try_count++;
+                continue;
+            }
+            if (p2p_get_chunk(d->peers[pi].ip, d->peers[pi].port, d->fname, start, clen, buf) == 0) {
+                EnterCriticalSection(&d->cs);
+                if (fseek(d->fpart, start, SEEK_SET) != 0) d->failed = 1;
+                else if (fwrite(buf, 1, (size_t)clen, d->fpart) != (size_t)clen) d->failed = 1;
+                else fflush(d->fpart);
+                if (!d->failed) {
+                    if (send_tracker_updatetracker(d->fname, start, cend, g_local_ip) != 0) {
+                        fprintf(stderr, "[%s] updatetracker after chunk failed (non-fatal)\n", peer_log_id());
+                    }
+                    if (save_map_file(d->map_path, d->map, d->map_nbytes) != 0) d->failed = 1;
+                }
+                LeaveCriticalSection(&d->cs);
+                /* Spec: "Peer5 downloading 1024 to 2048 bytes of movie1.avi from 124.24.124.24 6677" (no colon before downloading) */
+                printf("%s downloading %ld to %ld bytes of %s from %s %d\n",
+                    peer_log_id(), (long)start, (long)(start + clen - 1), d->fname, d->peers[pi].ip, d->peers[pi].port);
+                ok = 1;
+            } else {
+                Sleep(100);
+                try_count++;
+            }
+        }
+        if (!ok) {
+            EnterCriticalSection(&d->cs);
+            d->map[chunk / 8] &= (unsigned char)~(1u << (unsigned)(chunk % 8));
+            d->failed = 1;
+            LeaveCriticalSection(&d->cs);
+        }
+    }
+}
+
+static int run_download_data_file(const char *data_fname, const char *track_name_for_log,
+    long fsize, const char *expect_md5, struct PeerInfo *peers, int npeers) {
+    if (fsize < 0) return -1;
+    char tdir[MAX_PATH_LEN];
+    if (ensure_track_cache_dir(tdir, sizeof(tdir)) != 0) return -1;
+    if (strchr(data_fname, ' ')) { fprintf(stderr, "[%s] skip: spaces in name\n", peer_log_id()); return -1; }
+    {
+        char full[MAX_PATH_LEN];
+        if (file_path_join(shared_folder, data_fname, full, sizeof(full))) {
+            char m[33];
+            long sz;
+            if (compute_file_md5(full, m, &sz) == 0 && sz == fsize && _stricmp(m, expect_md5) == 0) {
+                char tc[MAX_PATH_LEN];
+                snprintf(tc, sizeof(tc), "%s\\%s", tdir, track_name_for_log);
+                remove(tc);
+                printf("[%s] already have %s; removed cached .track if any\n", peer_log_id(), data_fname);
+                return 0;
+            }
+        }
+    }
+    if (fsize == 0) {
+        char p[MAX_PATH_LEN];
+        if (!file_path_join(shared_folder, data_fname, p, sizeof(p))) return -1;
+        FILE *f = fopen(p, "wb");
+        if (f) fclose(f);
+        { char m[33]; long sz; if (compute_file_md5(p, m, &sz) != 0 || _stricmp(m, expect_md5) != 0) return -1; }
+        { char tc[MAX_PATH_LEN]; snprintf(tc, sizeof(tc), "%s\\%s", tdir, track_name_for_log); remove(tc); }
+        printf("[%s] file %s (empty) verified\n", peer_log_id(), data_fname);
+        return 0;
+    }
+    DlState st;
+    memset(&st, 0, sizeof(st));
+    strncpy(st.fname, data_fname, sizeof(st.fname) - 1);
+    snprintf(st.map_path, sizeof(st.map_path), "%s\\%s.chunkmap", tdir, data_fname);
+    snprintf(st.track_cache_path, sizeof(st.track_cache_path), "%s\\%s", tdir, track_name_for_log);
+    if (!file_path_join(shared_folder, data_fname, st.part_path, sizeof(st.part_path)))
+        return -1;
+    strncat(st.part_path, ".part", sizeof(st.part_path) - strlen(st.part_path) - 1);
+    st.filesize = fsize;
+    memcpy(st.expect_md5, expect_md5, 33);
+    memcpy(st.peers, peers, (size_t)npeers * sizeof(struct PeerInfo));
+    st.npeers = npeers;
+    { int u = 0; for (int i = 0; i < npeers; i++) if (!is_self_seeder(peers[i].ip, peers[i].port)) u++; if (u < 1) { fprintf(stderr, "[%s] no remote peers in .track for %s\n", peer_log_id(), data_fname); return -1; } }
+    st.nchunks = (int)((fsize + MAX_P2P_CHUNK - 1) / MAX_P2P_CHUNK);
+    st.map_nbytes = chunk_bytes(st.nchunks);
+    st.map = (unsigned char *)calloc(1, (size_t)st.map_nbytes);
+    if (!st.map) return -1;
+    st.fpart = fopen(st.part_path, "r+b");
+    if (st.fpart) {
+        if (fseek(st.fpart, 0, SEEK_END) == 0) {
+            if (ftell(st.fpart) != fsize) { fclose(st.fpart); st.fpart = NULL; }
+        } else { fclose(st.fpart); st.fpart = NULL; }
+    }
+    if (!st.fpart) {
+        st.fpart = fopen(st.part_path, "w+b");
+        if (!st.fpart) { free(st.map); return -1; }
+        if (_chsize(_fileno(st.fpart), fsize) != 0) { fclose(st.fpart); free(st.map); return -1; }
+    } else {
+        if (_chsize(_fileno(st.fpart), fsize) != 0) { fclose(st.fpart); free(st.map); return -1; }
+    }
+    if (GetFileAttributesA(st.map_path) != INVALID_FILE_ATTRIBUTES) {
+        if (load_map_file(st.map_path, st.map, st.map_nbytes) != 0) { memset(st.map, 0, (size_t)st.map_nbytes); }
+    }
+    InitializeCriticalSection(&st.cs);
+    st.failed = 0;
+    HANDLE w[P2P_DOWNLOAD_WORKERS];
+    int nthr = (st.nchunks < P2P_DOWNLOAD_WORKERS) ? st.nchunks : P2P_DOWNLOAD_WORKERS;
+    for (int t = 0; t < nthr; t++) {
+        w[t] = (HANDLE)_beginthreadex(NULL, 0, dl_worker, &st, 0, NULL);
+    }
+    for (int t = 0; t < nthr; t++) {
+        if (w[t]) { WaitForSingleObject(w[t], 600000); CloseHandle(w[t]); }
+    }
+    DeleteCriticalSection(&st.cs);
+    fclose(st.fpart);
+    st.fpart = NULL;
+    int all_done = 1;
+    for (int k = 0; k < st.nchunks; k++) {
+        if (!chunk_bit_test(st.map, k)) { all_done = 0; break; }
+    }
+    free(st.map);
+    if (!all_done || st.failed) {
+        fprintf(stderr, "%s: download incomplete for %s\n", peer_log_id(), data_fname);
+        return -1;
+    }
+    {
+        char finalpath[MAX_PATH_LEN];
+        if (!file_path_join(shared_folder, data_fname, finalpath, sizeof(finalpath))) return -1;
+        remove(finalpath);
+        if (rename(st.part_path, finalpath) != 0) { fprintf(stderr, "rename part failed err=%d\n", errno); return -1; }
+    }
+    {
+        char m[33];
+        long sz;
+        char p[MAX_PATH_LEN];
+        if (file_path_join(shared_folder, data_fname, p, sizeof(p)) && compute_file_md5(p, m, &sz) == 0) {
+            if (_stricmp(m, expect_md5) == 0) {
+                remove(st.map_path);
+                remove(st.track_cache_path);
+                printf("%s: file %s download complete, MD5 ok\n", peer_log_id(), data_fname);
+            } else {
+                fprintf(stderr, "[%s] MD5 mismatch after download for %s\n", peer_log_id(), data_fname);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void try_auto_downloads_from_list(void) {
+    for (int i = 0; i < num_available_files; i++) {
+        const char *tname = available_files[i].name;
+        if (strstr(tname, ".track") == NULL) continue;
+        char *body = NULL;
+        size_t blen = 0;
+        if (get_tracker_file_via_get(tname, &body, &blen) != 0) continue;
+        char tdir[MAX_PATH_LEN];
+        if (ensure_track_cache_dir(tdir, sizeof(tdir)) == 0) {
+            char cache[MAX_PATH_LEN];
+            if (file_path_join(tdir, tname, cache, sizeof(cache))) {
+                FILE *c = fopen(cache, "wb");
+                if (c) { fwrite(body, 1, blen, c); fclose(c); }
+            }
+        }
+        char df[256], md5[33];
+        long fsz;
+        struct PeerInfo peers[MAX_TRACK_PEERS];
+        int np = 0;
+        if (parse_track_text(body, df, &fsz, md5, peers, &np) != 0) {
+            free(body);
+            continue;
+        }
+        free(body);
+        /* Spec: "Peer3: Get movie1.avi" (data filename after resolving .track). */
+        printf("%s: Get %s\n", peer_log_id(), df);
+        run_download_data_file(df, tname, fsz, md5, peers, np);
+    }
+}
+
 static unsigned __stdcall refresh_thread(void *unused) {
     (void)unused;
-    printf("[refresh] Starting periodic tracker LIST every %d s\n", refresh_interval);
 
     for (;;) {
         if (g_auto_stop) break;
 
         socket_t sock;
         if (connect_to_tracker(&sock) != 0) {
-            printf("[refresh] Connect failed, retry later\n");
+            fprintf(stderr, "[%s] List (connect failed, retry later)\n", peer_log_id());
             Sleep(refresh_interval * 1000);
             continue;
         }
+
+        /* Spec: "Peer4: List" */
+        printf("%s: List\n", peer_log_id());
 
         const char *req = "<REQ LIST>\n";
         if (send_all(sock, req, strlen(req)) != 0) {
@@ -678,13 +1356,17 @@ static unsigned __stdcall refresh_thread(void *unused) {
             } else if (strstr(line, "<REP LIST ") == line) {
                 sscanf(line, "<REP LIST %d>", &expect_num);
             } else if (num_available_files < 100 && expect_num > 0 && sscanf(line, "<%*d %255s %ld %32s>", available_files[num_available_files].name, &available_files[num_available_files].size, available_files[num_available_files].md5) == 3) {
-                printf("[refresh] Found %s size=%ld md5=%s\n", available_files[num_available_files].name, available_files[num_available_files].size, available_files[num_available_files].md5);
                 num_available_files++;
             }
         }
         CLOSESOCK(sock);
 
-        if (!saw_end) printf("[refresh] Incomplete LIST response\n");
+        if (!saw_end) fprintf(stderr, "[%s] List incomplete response\n", peer_log_id());
+        else {
+            /* CS4390: after <REQ LIST>, for incomplete local files, GET latest .track and run P2P (project PDF). */
+            try_auto_downloads_from_list();
+        }
+        send_periodic_updatetracker_for_local_files();
 
         Sleep(refresh_interval * 1000);
     }
@@ -777,6 +1459,7 @@ int main(int argc, char *argv[]) {
     strncpy(g_local_ip, local_ip, sizeof(g_local_ip) - 1);
     g_local_ip[sizeof(g_local_ip) - 1] = '\0';
     CLOSESOCK(sockid);
+    sockid = INVALID_SOCKET;
 
     /*
         Auto mode: scan the shared folder, register new files with the tracker,
@@ -820,9 +1503,16 @@ int main(int argc, char *argv[]) {
         The following are the manual commands
         TODO: Need to make them automatic.
     */
+    if (connect_to_tracker(&sockid) != 0) {
+        fprintf(stderr, "Cannot connect to server\n");
+        stop_peer_server();
+        WSACleanup();
+        return EXIT_FAILURE;
+    }
 
     if (argc > 1 && !strcmp(argv[1], "list")) {
         /* Send LIST request to the tracker. */
+        printf("%s: List\n", peer_log_id());
         const char *req = "<REQ LIST>\n";
         if (send_all(sockid, req, strlen(req)) != 0) {
             fprintf(stderr, "Send <REQ LIST> failure\n");
@@ -848,6 +1538,7 @@ int main(int argc, char *argv[]) {
             if (!strcmp(line, "<REP LIST END>")) break;
         }
     } else if (argc > 2 && !strcmp(argv[1], "get")) {
+        printf("%s: Get %s\n", peer_log_id(), argv[2]);
         char req[512];
         snprintf(req, sizeof(req), "<GET %s >\n", argv[2]);
         if (send_all(sockid, req, strlen(req)) != 0) {
@@ -896,7 +1587,12 @@ int main(int argc, char *argv[]) {
             return EXIT_FAILURE;
         }
         trim_eol(line);
-        printf("%s\n", line);
+        if (strstr(line, "<createtracker succ>") || strstr(line, "<createtracker ferr>")) {
+            printf("%s: createtracker %s %s %s %s %s %d\n",
+                   peer_log_id(), argv[2], argv[3], argv[4], argv[5], local_ip, peer_listen_port);
+        } else {
+            printf("%s\n", line);
+        }
     } else if (argc > 4 && !strcmp(argv[1], "updatetracker")) {
         char req[1024];
         snprintf(req, sizeof(req), "<updatetracker %s %s %s %s %d>\n",
@@ -922,7 +1618,9 @@ int main(int argc, char *argv[]) {
         printf("%s\n", line);
     }
 
-    CLOSESOCK(sockid);
+    if (sockid != INVALID_SOCKET) {
+        CLOSESOCK(sockid);
+    }
     printf("Connection closed\n");
 
     stop_peer_server();

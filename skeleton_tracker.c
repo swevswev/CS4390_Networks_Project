@@ -22,6 +22,7 @@ typedef SOCKET socket_t;
 
 /* Serialize tracker file reads/writes across worker threads. */
 static CRITICAL_SECTION g_tracker_fs_lock;
+static int g_refresh_interval = 900;
 
 /* Thread-safe tokenizer: splits in place; returns number of tokens (strtok is not thread-safe). */
 static int split_tokens(char *line, char *tokens[], int max_tokens) {
@@ -78,6 +79,24 @@ static int load_tracker_port_from_client_config(void) {
 
     fclose(f);
     return port;
+}
+
+/* Read refresh interval from client config line 3 (fallback 900). */
+static int load_refresh_interval_from_client_config(void) {
+    FILE *f = fopen("clientThreadConfig.cfg", "r");
+    char line[256];
+    int interval = 900;
+    if (!f) return interval;
+
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return interval; } /* line 1 */
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return interval; } /* line 2 */
+    if (fgets(line, sizeof(line), f)) {
+        strip_comment_line(line);
+        int tmp;
+        if (first_int_in_line(line, &tmp) && tmp > 0) interval = tmp;
+    }
+    fclose(f);
+    return interval;
 }
 
 static const char *TRACKER_DIR = "tracker_shared";
@@ -266,6 +285,124 @@ static long current_unix_time(void) {
     return (long)time(NULL);
 }
 
+/*
+ * Accepted peer line formats:
+ *   peer ip:port:start:end:timestamp   (preferred/spec-style)
+ *   peer ip port start end timestamp   (legacy)
+ *   peer ip port                       (legacy minimal; no range/timestamp)
+ */
+static int parse_peer_line(const char *line,
+                           char *ip_out, size_t ip_sz,
+                           char *port_out, size_t port_sz,
+                           char *start_out, size_t start_sz,
+                           char *end_out, size_t end_sz,
+                           long *timestamp_out, int *has_timestamp) {
+    char tag[32];
+    char a[256], b[64], c[64], d[64], e[64];
+    if (sscanf(line, "%31s %255s", tag, a) < 2 || strcmp(tag, "peer") != 0) return 0;
+
+    if (sscanf(line, "peer %255[^:]:%63[^:]:%63[^:]:%63[^:]:%63s", a, b, c, d, e) == 5) {
+        strncpy(ip_out, a, ip_sz - 1); ip_out[ip_sz - 1] = '\0';
+        strncpy(port_out, b, port_sz - 1); port_out[port_sz - 1] = '\0';
+        strncpy(start_out, c, start_sz - 1); start_out[start_sz - 1] = '\0';
+        strncpy(end_out, d, end_sz - 1); end_out[end_sz - 1] = '\0';
+        *timestamp_out = atol(e);
+        *has_timestamp = 1;
+        return 1;
+    }
+
+    if (sscanf(line, "peer %255s %63s %63s %63s %63s", a, b, c, d, e) == 5) {
+        strncpy(ip_out, a, ip_sz - 1); ip_out[ip_sz - 1] = '\0';
+        strncpy(port_out, b, port_sz - 1); port_out[port_sz - 1] = '\0';
+        strncpy(start_out, c, start_sz - 1); start_out[start_sz - 1] = '\0';
+        strncpy(end_out, d, end_sz - 1); end_out[end_sz - 1] = '\0';
+        *timestamp_out = atol(e);
+        *has_timestamp = 1;
+        return 1;
+    }
+
+    if (sscanf(line, "peer %255s %63s", a, b) == 2) {
+        strncpy(ip_out, a, ip_sz - 1); ip_out[ip_sz - 1] = '\0';
+        strncpy(port_out, b, port_sz - 1); port_out[port_sz - 1] = '\0';
+        strncpy(start_out, "0", start_sz - 1); start_out[start_sz - 1] = '\0';
+        strncpy(end_out, "0", end_sz - 1); end_out[end_sz - 1] = '\0';
+        *timestamp_out = 0;
+        *has_timestamp = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * Dead peer policy:
+ * - A peer entry is stale if it has a timestamp and age > 2 * refresh_interval.
+ * - Entries without a timestamp are preserved for basic backward compatibility.
+ */
+static int prune_stale_peer_entries_in_file(const char *path) {
+    FILE *in = fopen(path, "rb");
+    if (!in) return -1;
+
+    char tmp_path[560];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    FILE *out = fopen(tmp_path, "wb");
+    if (!out) {
+        fclose(in);
+        return -1;
+    }
+
+    long now = current_unix_time();
+    long stale_threshold = (long)g_refresh_interval * 2L;
+    char line[4096];
+    int changed = 0;
+
+    while (fgets(line, sizeof(line), in)) {
+        char ip[256], port[64], start_b[64], end_b[64];
+        long ts = 0;
+        int has_ts = 0;
+        if (parse_peer_line(line, ip, sizeof(ip), port, sizeof(port), start_b, sizeof(start_b), end_b, sizeof(end_b), &ts, &has_ts)) {
+            if (has_ts && (now - ts) > stale_threshold) {
+                changed = 1;
+                continue;
+            }
+            fprintf(out, "peer %s:%s:%s:%s:%ld\n", ip, port, start_b, end_b, has_ts ? ts : now);
+            if (strchr(line, ':') == NULL) changed = 1;
+        } else {
+            fputs(line, out);
+        }
+    }
+
+    fclose(in);
+    fclose(out);
+
+    if (!changed) {
+        remove(tmp_path);
+        return 0;
+    }
+    if (remove(path) != 0 || rename(tmp_path, path) != 0) {
+        remove(tmp_path);
+        return -1;
+    }
+    return 0;
+}
+
+static void prune_stale_peer_entries_all_tracks(void) {
+    ensure_tracker_dir();
+    char search[512];
+    snprintf(search, sizeof(search), "%s\\*.track", TRACKER_DIR);
+
+    WIN32_FIND_DATAA ffd;
+    HANDLE h = FindFirstFileA(search, &ffd);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char path[512];
+        tracker_path_for(ffd.cFileName, path);
+        (void)prune_stale_peer_entries_in_file(path);
+    } while (FindNextFileA(h, &ffd));
+    FindClose(h);
+}
+
 static void handle_createtracker(socket_t client, char *line) {
     /* Expected: <createtracker filename filesize description md5 ip port>\n */
     trim_angle(line);
@@ -285,6 +422,8 @@ static void handle_createtracker(socket_t client, char *line) {
     const char *md5 = tokens[4];
     const char *ip = tokens[5];
     const char *port = tokens[6];
+    long fsz_num = atol(filesize);
+    long end_b = (fsz_num > 0) ? (fsz_num - 1) : 0;
 
     char track_name[300];
     /* If client already passed .track, keep it; otherwise append */
@@ -315,7 +454,8 @@ static void handle_createtracker(socket_t client, char *line) {
     fprintf(f, "filesize %s\n", filesize);
     fprintf(f, "description %s\n", desc);
     fprintf(f, "md5 %s\n", md5);
-    fprintf(f, "peer %s %s 0 %s %ld\n", ip, port, filesize, current_unix_time());
+    /* Peer line uses spec-style colon-separated fields. */
+    fprintf(f, "peer %s:%s:0:%ld:%ld\n", ip, port, end_b, current_unix_time());
     fclose(f);
 
     send_all(client, "<createtracker succ>\n", strlen("<createtracker succ>\n"));
@@ -381,21 +521,18 @@ static void handle_updatetracker(socket_t client, char *line) {
     char file_line[4096];
     int replaced = 0;
     while (fgets(file_line, sizeof(file_line), in)) {
-        char ip_old[128], port_old[32], s_old[64], e_old[64], t_old[64];
-        if (sscanf(file_line, "peer %127s %31s %63s %63s %63s", ip_old, port_old, s_old, e_old, t_old) == 5) {
+        char ip_old[256], port_old[64], s_old[64], e_old[64];
+        long ts_old = 0;
+        int has_ts_old = 0;
+        if (parse_peer_line(file_line, ip_old, sizeof(ip_old), port_old, sizeof(port_old), s_old, sizeof(s_old), e_old, sizeof(e_old), &ts_old, &has_ts_old)) {
             if (strcmp(ip_old, ip) == 0 && strcmp(port_old, port) == 0) {
-                fprintf(out, "peer %s %s %s %s %ld\n", ip, port, start_b, end_b, current_unix_time());
+                fprintf(out, "peer %s:%s:%s:%s:%ld\n", ip, port, start_b, end_b, current_unix_time());
                 replaced = 1;
+            } else if (has_ts_old && (current_unix_time() - ts_old) > ((long)g_refresh_interval * 2L)) {
+                /* Drop stale entries during rewrite. */
+                continue;
             } else {
-                fputs(file_line, out);
-            }
-        } else if (sscanf(file_line, "peer %127s %31s", ip_old, port_old) == 2) {
-            /* Backward compatibility with older tracker entries without range/time. */
-            if (strcmp(ip_old, ip) == 0 && strcmp(port_old, port) == 0) {
-                fprintf(out, "peer %s %s %s %s %ld\n", ip, port, start_b, end_b, current_unix_time());
-                replaced = 1;
-            } else {
-                fputs(file_line, out);
+                fprintf(out, "peer %s:%s:%s:%s:%ld\n", ip_old, port_old, s_old, e_old, has_ts_old ? ts_old : current_unix_time());
             }
         } else {
             fputs(file_line, out);
@@ -403,7 +540,7 @@ static void handle_updatetracker(socket_t client, char *line) {
     }
 
     if (!replaced) {
-        fprintf(out, "peer %s %s %s %s %ld\n", ip, port, start_b, end_b, current_unix_time());
+        fprintf(out, "peer %s:%s:%s:%s:%ld\n", ip, port, start_b, end_b, current_unix_time());
     }
 
     fclose(in);
@@ -444,6 +581,7 @@ static int read_entire_file(const char *path, char **out_buf, size_t *out_len) {
 }
 
 static void handle_list(socket_t client) {
+    prune_stale_peer_entries_all_tracks();
     ensure_tracker_dir();
 
     char search[512];
@@ -508,6 +646,7 @@ static void handle_get(socket_t client, char *line) {
     ensure_tracker_dir();
     char path[512];
     tracker_path_for(name, path);
+    (void)prune_stale_peer_entries_in_file(path);
 
     char *content = NULL;
     size_t content_len = 0;
@@ -569,6 +708,7 @@ int main(void) {
     struct sockaddr_in addr;
 
     int port = load_tracker_port_from_client_config(); /* TODO: Read info from sconfig.cfg */
+    g_refresh_interval = load_refresh_interval_from_client_config();
 
     InitializeCriticalSection(&g_tracker_fs_lock);
 
